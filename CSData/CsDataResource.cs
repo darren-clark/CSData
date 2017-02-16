@@ -1,6 +1,7 @@
 ﻿namespace CSData
 {
     using System;
+    using System.Collections.Concurrent;
     using System.Collections.Generic;
     using System.Linq;
     using System.Linq.Expressions;
@@ -12,9 +13,9 @@
         private readonly ICsDataAdapter adapter;
         private readonly string name;
         private readonly Func<TResource, TKey> indexer;
-        private readonly Dictionary<TKey, Task<TResource>> resources = new Dictionary<TKey, Task<TResource>>();
-        private readonly Dictionary<Expression<Func<TResource, bool>>, Task<TResource>> filters = new Dictionary<Expression<Func<TResource, bool>>, Task<TResource>>();
-        private readonly ReaderWriterLockSlim readerWriterLock = new ReaderWriterLockSlim();
+        private readonly ConcurrentDictionary<TKey, TResource> resources = new ConcurrentDictionary<TKey, TResource>();
+        private readonly Dictionary<TKey, Task<TResource>> inFlight = new Dictionary<TKey, Task<TResource>>();
+        private readonly object inFlightLock = new object();
 
         public CsDataResource(ICsDataAdapter adapter, string name, Func<TResource, TKey> indexer)
         {
@@ -25,17 +26,9 @@
 
         private void Inject(IEnumerable<TResource> resources, CsDataInjectOptions options)
         {
-            readerWriterLock.EnterWriteLock();
-            try
+            foreach (var resource in resources)
             {
-                foreach (var resource in resources)
-                {
-                    this.resources[indexer(resource)] = Task.FromResult(resource);
-                }
-            }
-            finally
-            {
-                readerWriterLock.ExitWriteLock();
+                this.resources[indexer(resource)] = resource;
             }
         }
 
@@ -51,51 +44,32 @@
 
         private Task<TResource> Find(TKey key, CsDataFindOptions options)
         {
-            Task<TResource> result;
-            readerWriterLock.EnterReadLock();
-            try
+            TResource cached;
+            if (resources.TryGetValue(key, out cached))
             {
-                if (this.resources.TryGetValue(key, out result))
-                    return result;
-            }
-            finally
-            {
-                readerWriterLock.ExitReadLock();
+                return Task.FromResult(cached);
             }
 
-            readerWriterLock.EnterUpgradeableReadLock();
-            try
+            lock (this.inFlightLock)
             {
-                if (this.resources.TryGetValue(key, out result))
-                    return result;
-
-                readerWriterLock.EnterWriteLock();
-                try
+                Task<TResource> inFlight;
+                if (!this.inFlight.TryGetValue(key, out inFlight))
                 {
-                    this.resources[key] = result = this.adapter.Find<TKey, TResource>(key);
-                    result.ContinueWith(t =>
+                    this.inFlight[key] = inFlight = this.adapter.Find<TKey, TResource>(key);
+                    inFlight.ContinueWith(t =>
                     {
-                        this.readerWriterLock.EnterWriteLock();
-                        try
+                        if (t.IsCompleted)
                         {
-                            this.resources.Remove(key);
+                            this.Inject(new[] { t.Result }, options);
                         }
-                        finally
+                        lock (this.inFlightLock)
                         {
-                            this.readerWriterLock.ExitWriteLock();
+                            this.inFlight.Remove(key);
                         }
-                    }, TaskContinuationOptions.NotOnRanToCompletion);
-                }
-                finally
-                {
-                    readerWriterLock.ExitWriteLock();
+                    });
                 }
 
-                return result;
-            }
-            finally
-            {
-                readerWriterLock.ExitUpgradeableReadLock();
+                return inFlight;
             }
         }
 
